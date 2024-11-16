@@ -1,0 +1,6 @@
+tunnel: <Tunnel ID>
+credentials-file: ./credentials.json
+ingress:
+  - hostname: <Domain>
+    service: http://localhost:<Port>
+  - service: http_status:404
