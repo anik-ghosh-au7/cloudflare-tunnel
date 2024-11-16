@@ -1,0 +1,4 @@
+{
+  "ApiToken": "<CLOUDFLARE_API_TOKEN>",
+  "ZoneId": "<ZONE_ID>"
+}

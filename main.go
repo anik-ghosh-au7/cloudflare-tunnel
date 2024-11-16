@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -14,11 +17,38 @@ import (
 	"syscall"
 )
 
+// DNSRecord holds the information for Cloudflare DNS records.
+type DNSRecord struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Value string `json:"content"`
+}
+
 // TunnelCredentials holds the tunnel credentials.
 type TunnelCredentials struct {
 	AccountTag   string `json:"AccountTag"`
 	TunnelSecret string `json:"TunnelSecret"`
 	TunnelID     string `json:"TunnelID"`
+}
+
+// APIKeys holds the API Token and Zone ID from the JSON file.
+type APIKeys struct {
+	ApiToken string `json:"ApiToken"`
+	ZoneID   string `json:"ZoneId"`
+}
+
+// loadAPIKeys loads the API keys from the specified file.
+func loadAPIKeys(filePath string) (*APIKeys, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	var keys APIKeys
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return nil, err
+	}
+	return &keys, nil
 }
 
 // loadCredentials reads and unmarshals the credentials file.
@@ -72,16 +102,72 @@ func createTunnel(ctx context.Context, tunnelName, credentialsPath string) *Tunn
 	return creds
 }
 
-// ensureDNSRecord ensures that the DNS record exists in Cloudflare for the tunnel.
-func ensureDNSRecord(tunnelName, domain string) {
-	log.Printf("Ensuring DNS record exists for %s...\n", domain)
-	cmd := exec.Command("cloudflared", "tunnel", "route", "dns", tunnelName, domain)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("Failed to create or verify DNS record: %v", err)
+// cloudflareAPIRequest makes a request to the Cloudflare API.
+func cloudflareAPIRequest(method, url, apiToken string, payload []byte) ([]byte, error) {
+	client := &http.Client{}
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, err
 	}
-	log.Println("DNS record verified/created successfully.")
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		log.Fatalf("Cloudflare API request failed: %s\n", body)
+	}
+
+	return ioutil.ReadAll(resp.Body)
+}
+
+// dnsRecordExists checks if a DNS record for the domain already exists using Cloudflare API.
+func dnsRecordExists(zoneID, domain, apiToken string) bool {
+	log.Printf("Checking if DNS record exists for %s...\n", domain)
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s", zoneID, domain)
+	resp, err := cloudflareAPIRequest("GET", url, apiToken, nil)
+	if err != nil {
+		log.Fatalf("Failed to query DNS record: %v", err)
+	}
+
+	var result struct {
+		Success bool        `json:"success"`
+		Result  []DNSRecord `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		log.Fatalf("Failed to parse DNS record query response: %v", err)
+	}
+
+	return len(result.Result) > 0
+}
+
+// ensureDNSRecord ensures that the DNS record exists for the tunnel.
+func ensureDNSRecord(zoneID, domain, tunnelID, apiToken string) {
+	if dnsRecordExists(zoneID, domain, apiToken) {
+		log.Println("DNS record already exists. Skipping creation.")
+		return
+	}
+
+	log.Printf("Creating DNS record for %s...\n", domain)
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", zoneID)
+	record := DNSRecord{
+		Type:  "CNAME",
+		Name:  domain,
+		Value: tunnelID + ".cfargotunnel.com",
+	}
+
+	payload, _ := json.Marshal(record)
+	_, err := cloudflareAPIRequest("POST", url, apiToken, payload)
+	if err != nil {
+		log.Fatalf("Failed to create DNS record: %v", err)
+	}
+	log.Println("DNS record created successfully.")
 }
 
 // writeConfigFile generates a Cloudflare Tunnel configuration file.
@@ -97,12 +183,10 @@ func writeConfigFile(tunnelName string, ports []int, domain, credentialsPath str
 	fmt.Fprintf(file, "credentials-file: %s\n", credentialsPath)
 	fmt.Fprintln(file, "ingress:")
 
-	// For each port, route under the same domain
 	for _, port := range ports {
 		fmt.Fprintf(file, "  - hostname: %s\n", domain)
 		fmt.Fprintf(file, "    service: http://localhost:%d\n", port)
 	}
-
 	fmt.Fprintln(file, "  - service: http_status:404")
 
 	log.Printf("Config file created at: %s\n", configPath)
@@ -125,11 +209,17 @@ func main() {
 	portsFlag := flag.String("ports", "", "Comma-separated list of ports to forward (e.g., 3000,5173)")
 	tunnelName := flag.String("tunnel", "default-tunnel", "Cloudflare Tunnel name")
 	domain := flag.String("domain", "anik.cc", "Root domain to route traffic (e.g., anik.cc)")
+	apiKeysPath := flag.String("apiKeys", "./api-keys.json", "Path to the API keys file")
 	credentialsPath := flag.String("credentials", "./credentials.json", "Path to the tunnel credentials file")
 	flag.Parse()
 
 	if *portsFlag == "" {
 		log.Fatal("No ports specified. Use --ports to specify ports.")
+	}
+
+	apiKeys, err := loadAPIKeys(*apiKeysPath)
+	if err != nil {
+		log.Fatalf("Failed to load API keys: %v", err)
 	}
 
 	ports := []int{}
@@ -141,7 +231,6 @@ func main() {
 		ports = append(ports, port)
 	}
 
-	// Check for existing credentials
 	creds, err := loadCredentials(*credentialsPath)
 	if err != nil {
 		log.Println("Credentials not found. Authenticating and creating a new tunnel...")
@@ -154,8 +243,7 @@ func main() {
 		log.Println("Reusing existing tunnel credentials.")
 	}
 
-	// Ensure the DNS record exists
-	ensureDNSRecord(*tunnelName, *domain)
+	ensureDNSRecord(apiKeys.ZoneID, *domain, creds.TunnelID, apiKeys.ApiToken)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -164,7 +252,6 @@ func main() {
 
 	tunnelCmd := startTunnel(ctx, configPath)
 
-	// Handle graceful shutdown
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 
