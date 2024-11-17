@@ -58,7 +58,7 @@ Rename `api-keys.sample.json` to `api-keys.json` and update with your Cloudflare
 
 #### Tunnel Credentials
 
-Rename `credentials.sample.json` to `credentials.json`:
+Stored in `credentials.json`:
 
 ```json
 {
@@ -70,7 +70,7 @@ Rename `credentials.sample.json` to `credentials.json`:
 
 #### Tunnel Configuration
 
-Rename `config.sample.yml` to `config.yml`:
+Saved in `<TUNNEL_ID>-config.yml`:
 
 ```yml
 tunnel: <Tunnel ID>
