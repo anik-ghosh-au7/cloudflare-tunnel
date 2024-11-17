@@ -12,8 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 )
 
@@ -171,7 +169,7 @@ func ensureDNSRecord(zoneID, domain, tunnelID, apiToken string) {
 }
 
 // writeConfigFile generates a Cloudflare Tunnel configuration file.
-func writeConfigFile(tunnelName string, ports []int, domain, credentialsPath string) string {
+func writeConfigFile(tunnelName string, port int, domain, credentialsPath string) string {
 	configPath := fmt.Sprintf("./%s-config.yml", tunnelName)
 	file, err := os.Create(configPath)
 	if err != nil {
@@ -183,10 +181,8 @@ func writeConfigFile(tunnelName string, ports []int, domain, credentialsPath str
 	fmt.Fprintf(file, "credentials-file: %s\n", credentialsPath)
 	fmt.Fprintln(file, "ingress:")
 
-	for _, port := range ports {
-		fmt.Fprintf(file, "  - hostname: %s\n", domain)
-		fmt.Fprintf(file, "    service: http://localhost:%d\n", port)
-	}
+	fmt.Fprintf(file, "  - hostname: %s\n", domain)
+	fmt.Fprintf(file, "    service: http://localhost:%d\n", port)
 	fmt.Fprintln(file, "  - service: http_status:404")
 
 	log.Printf("Config file created at: %s\n", configPath)
@@ -206,29 +202,20 @@ func startTunnel(ctx context.Context, configPath string) *exec.Cmd {
 }
 
 func main() {
-	portsFlag := flag.String("ports", "", "Comma-separated list of ports to forward (e.g., 3000,5173)")
+	portFlag := flag.Int("port", 0, "Port to forward (e.g., 5173)")
 	tunnelName := flag.String("tunnel", "default-tunnel", "Cloudflare Tunnel name")
 	domain := flag.String("domain", "anik.cc", "Root domain to route traffic (e.g., anik.cc)")
 	apiKeysPath := flag.String("apiKeys", "./api-keys.json", "Path to the API keys file")
 	credentialsPath := flag.String("credentials", "./credentials.json", "Path to the tunnel credentials file")
 	flag.Parse()
 
-	if *portsFlag == "" {
-		log.Fatal("No ports specified. Use --ports to specify ports.")
+	if *portFlag == 0 {
+		log.Fatal("No valid port specified. Use --port to specify a port.")
 	}
 
 	apiKeys, err := loadAPIKeys(*apiKeysPath)
 	if err != nil {
 		log.Fatalf("Failed to load API keys: %v", err)
-	}
-
-	ports := []int{}
-	for _, portStr := range strings.Split(*portsFlag, ",") {
-		port, err := strconv.Atoi(strings.TrimSpace(portStr))
-		if err != nil {
-			log.Fatalf("Invalid port specified: %s", portStr)
-		}
-		ports = append(ports, port)
 	}
 
 	creds, err := loadCredentials(*credentialsPath)
@@ -248,7 +235,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	configPath := writeConfigFile(creds.TunnelID, ports, *domain, *credentialsPath)
+	configPath := writeConfigFile(creds.TunnelID, *portFlag, *domain, *credentialsPath)
 
 	tunnelCmd := startTunnel(ctx, configPath)
 
