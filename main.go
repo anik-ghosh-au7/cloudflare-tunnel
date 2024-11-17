@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -118,11 +118,11 @@ func cloudflareAPIRequest(method, url, apiToken string, payload []byte) ([]byte,
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		log.Fatalf("Cloudflare API request failed: %s\n", body)
 	}
 
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 // dnsRecordExists checks if a DNS record for the domain already exists using Cloudflare API.
