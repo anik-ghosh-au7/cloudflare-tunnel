@@ -25,9 +25,10 @@ The `cloudflare-tunnel` simplifies creating and managing Cloudflare Tunnels to r
 
 3. **Cloudflare Tunnel Installed**:
    - Install `cloudflared`:
-     ```bash
+
+```bash
      brew install cloudflare/cloudflare/cloudflared
-     ```
+```
 
 ---
 
