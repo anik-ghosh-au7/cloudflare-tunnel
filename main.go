@@ -40,11 +40,14 @@ type APIKeys struct {
 func loadAPIKeys(filePath string) (*APIKeys, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read API keys file: %w", err)
 	}
 	var keys APIKeys
 	if err := json.Unmarshal(data, &keys); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal API keys: %w", err)
+	}
+	if keys.ApiToken == "" || keys.ZoneID == "" {
+		return nil, fmt.Errorf("API Token or Zone ID is missing in the API keys file")
 	}
 	return &keys, nil
 }
@@ -53,11 +56,11 @@ func loadAPIKeys(filePath string) (*APIKeys, error) {
 func loadCredentials(filePath string) (*TunnelCredentials, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read credentials file: %w", err)
 	}
 	var creds TunnelCredentials
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal credentials: %w", err)
 	}
 	return &creds, nil
 }
@@ -66,7 +69,7 @@ func loadCredentials(filePath string) (*TunnelCredentials, error) {
 func saveCredentials(filePath string, creds *TunnelCredentials) error {
 	data, err := json.MarshalIndent(creds, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal credentials: %w", err)
 	}
 	return os.WriteFile(filePath, data, 0600)
 }
@@ -105,27 +108,26 @@ func cloudflareAPIRequest(method, url, apiToken string, payload []byte) ([]byte,
 	client := &http.Client{}
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(payload))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create API request: %w", err)
 	}
-
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		log.Fatalf("Cloudflare API request failed: %s\n", body)
+		return nil, fmt.Errorf("API request error: %s", body)
 	}
 
 	return io.ReadAll(resp.Body)
 }
 
-// dnsRecordExists checks if a DNS record for the domain already exists using Cloudflare API.
+// dnsRecordExists checks if a DNS record for the domain already exists.
 func dnsRecordExists(zoneID, domain, apiToken string) bool {
 	log.Printf("Checking if DNS record exists for %s...\n", domain)
 	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s", zoneID, domain)
@@ -161,15 +163,14 @@ func ensureDNSRecord(zoneID, domain, tunnelID, apiToken string) {
 	}
 
 	payload, _ := json.Marshal(record)
-	_, err := cloudflareAPIRequest("POST", url, apiToken, payload)
-	if err != nil {
+	if _, err := cloudflareAPIRequest("POST", url, apiToken, payload); err != nil {
 		log.Fatalf("Failed to create DNS record: %v", err)
 	}
 	log.Println("DNS record created successfully.")
 }
 
 // writeConfigFile generates a Cloudflare Tunnel configuration file.
-func writeConfigFile(tunnelName, tunnelID string, port int, domain, credentialsPath string) string {
+func writeConfigFile(tunnelID string, port int, domain, credentialsPath string) string {
 	configPath := fmt.Sprintf("./%s-config.yml", tunnelID)
 	file, err := os.Create(configPath)
 	if err != nil {
@@ -180,7 +181,6 @@ func writeConfigFile(tunnelName, tunnelID string, port int, domain, credentialsP
 	fmt.Fprintf(file, "tunnel: %s\n", tunnelID)
 	fmt.Fprintf(file, "credentials-file: %s\n", credentialsPath)
 	fmt.Fprintln(file, "ingress:")
-
 	fmt.Fprintf(file, "  - hostname: %s\n", domain)
 	fmt.Fprintf(file, "    service: http://localhost:%d\n", port)
 	fmt.Fprintln(file, "  - service: http_status:404")
@@ -201,6 +201,19 @@ func startTunnel(ctx context.Context, configPath string) *exec.Cmd {
 	return cmd
 }
 
+// logoutCloudflare ensures a graceful logout of Cloudflare.
+func logoutCloudflare() {
+	log.Println("Logging out of Cloudflare...")
+	cmd := exec.Command("cloudflared", "tunnel", "logout")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to logout from Cloudflare: %v", err)
+	} else {
+		log.Println("Successfully logged out from Cloudflare.")
+	}
+}
+
 func main() {
 	portFlag := flag.Int("port", 0, "Port to forward (e.g., 5173)")
 	tunnelName := flag.String("tunnel", "", "Cloudflare Tunnel name")
@@ -213,19 +226,22 @@ func main() {
 		log.Println("No arguments provided, attempting to load previous configuration.")
 		creds, err := loadCredentials(*credentialsPath)
 		if err != nil {
-			log.Fatalf("Previous configuration not found and required arguments not passed: %v", err)
+			log.Fatalf("Previous configuration not found: %v", err)
 		}
 		configPath := fmt.Sprintf("./%s-config.yml", creds.TunnelID)
 		if _, err := os.Stat(configPath); os.IsNotExist(err) {
 			log.Fatalf("Previous config file %s not found.", configPath)
 		}
 		log.Printf("Using previous configuration: %s", configPath)
-		*portFlag = 0
-		tunnelCmd := startTunnel(context.Background(), configPath)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		defer logoutCloudflare()
+		tunnelCmd := startTunnel(ctx, configPath)
 		signalChan := make(chan os.Signal, 1)
 		signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 		<-signalChan
 		log.Println("Termination signal received...")
+		cancel()
 		tunnelCmd.Wait()
 		return
 	}
@@ -246,10 +262,12 @@ func main() {
 	}
 
 	ensureDNSRecord(apiKeys.ZoneID, *domain, creds.TunnelID, apiKeys.ApiToken)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	defer logoutCloudflare()
 
-	configPath := writeConfigFile(*tunnelName, creds.TunnelID, *portFlag, *domain, *credentialsPath)
+	configPath := writeConfigFile(creds.TunnelID, *portFlag, *domain, *credentialsPath)
 	tunnelCmd := startTunnel(ctx, configPath)
 
 	signalChan := make(chan os.Signal, 1)
