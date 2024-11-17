@@ -169,15 +169,15 @@ func ensureDNSRecord(zoneID, domain, tunnelID, apiToken string) {
 }
 
 // writeConfigFile generates a Cloudflare Tunnel configuration file.
-func writeConfigFile(tunnelName string, port int, domain, credentialsPath string) string {
-	configPath := fmt.Sprintf("./%s-config.yml", tunnelName)
+func writeConfigFile(tunnelName, tunnelID string, port int, domain, credentialsPath string) string {
+	configPath := fmt.Sprintf("./%s-config.yml", tunnelID)
 	file, err := os.Create(configPath)
 	if err != nil {
 		log.Fatalf("Failed to create config file: %v", err)
 	}
 	defer file.Close()
 
-	fmt.Fprintf(file, "tunnel: %s\n", tunnelName)
+	fmt.Fprintf(file, "tunnel: %s\n", tunnelID)
 	fmt.Fprintf(file, "credentials-file: %s\n", credentialsPath)
 	fmt.Fprintln(file, "ingress:")
 
@@ -203,14 +203,31 @@ func startTunnel(ctx context.Context, configPath string) *exec.Cmd {
 
 func main() {
 	portFlag := flag.Int("port", 0, "Port to forward (e.g., 5173)")
-	tunnelName := flag.String("tunnel", "default-tunnel", "Cloudflare Tunnel name")
-	domain := flag.String("domain", "anik.cc", "Root domain to route traffic (e.g., anik.cc)")
+	tunnelName := flag.String("tunnel", "", "Cloudflare Tunnel name")
+	domain := flag.String("domain", "", "Root domain to route traffic (e.g., anik.cc)")
 	apiKeysPath := flag.String("apiKeys", "./api-keys.json", "Path to the API keys file")
 	credentialsPath := flag.String("credentials", "./credentials.json", "Path to the tunnel credentials file")
 	flag.Parse()
 
-	if *portFlag == 0 {
-		log.Fatal("No valid port specified. Use --port to specify a port.")
+	if *portFlag == 0 || *tunnelName == "" || *domain == "" {
+		log.Println("No arguments provided, attempting to load previous configuration.")
+		creds, err := loadCredentials(*credentialsPath)
+		if err != nil {
+			log.Fatalf("Previous configuration not found and required arguments not passed: %v", err)
+		}
+		configPath := fmt.Sprintf("./%s-config.yml", creds.TunnelID)
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
+			log.Fatalf("Previous config file %s not found.", configPath)
+		}
+		log.Printf("Using previous configuration: %s", configPath)
+		*portFlag = 0
+		tunnelCmd := startTunnel(context.Background(), configPath)
+		signalChan := make(chan os.Signal, 1)
+		signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+		<-signalChan
+		log.Println("Termination signal received...")
+		tunnelCmd.Wait()
+		return
 	}
 
 	apiKeys, err := loadAPIKeys(*apiKeysPath)
@@ -226,25 +243,19 @@ func main() {
 		if err := saveCredentials(*credentialsPath, creds); err != nil {
 			log.Fatalf("Failed to save tunnel credentials: %v", err)
 		}
-	} else {
-		log.Println("Reusing existing tunnel credentials.")
 	}
 
 	ensureDNSRecord(apiKeys.ZoneID, *domain, creds.TunnelID, apiKeys.ApiToken)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	configPath := writeConfigFile(creds.TunnelID, *portFlag, *domain, *credentialsPath)
-
+	configPath := writeConfigFile(*tunnelName, creds.TunnelID, *portFlag, *domain, *credentialsPath)
 	tunnelCmd := startTunnel(ctx, configPath)
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-
 	<-signalChan
 	log.Println("Termination signal received...")
-
 	cancel()
 	tunnelCmd.Wait()
 	log.Println("Cloudflare Tunnel stopped.")
